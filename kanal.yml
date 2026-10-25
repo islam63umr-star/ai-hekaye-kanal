@@ -1,0 +1,82 @@
+name: auto-kanal
+
+on:
+  schedule:
+    - cron: "30 0 */2 * *"   # iki gündən bir: video yarat (günün pulsuz limiti yeni dolanda)
+    - cron: "0 3 * * *"      # hər gün: şəkil kitabxanasını genişləndir
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Nə işləsin?"
+        type: choice
+        options:
+          - library
+          - test-video
+          - video
+        default: library
+
+permissions:
+  contents: write
+
+jobs:
+  library:
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.task == 'library') || github.event.schedule == '0 3 * * *' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Şəkilləri yarat
+        run: python -u kanal.py library
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Repoya yaz
+        run: |
+          git config user.name "kanal-bot"
+          git config user.email "kanal-bot@users.noreply.github.com"
+          git add images
+          git diff --cached --quiet || (git commit -m "Şəkil kitabxanası yeniləndi" && git pull --rebase && git push)
+
+  video:
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.task == 'video' || inputs.task == 'test-video')) || github.event.schedule == '30 0 */2 * *' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ffmpeg və şrift
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - run: pip install -r requirements.txt
+      - name: Video yarat
+        run: python -u kanal.py video --minutes ${{ (github.event_name == 'workflow_dispatch' && inputs.task == 'test-video') && '3' || (vars.MINUTES || '10') }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      - name: YouTube-a yüklə
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.task == 'test-video') }}
+        run: python -u kanal.py upload
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          VIDEO_PRIVACY: ${{ vars.VIDEO_PRIVACY || 'public' }}
+      - name: Hazır videonu saxla (3 gün)
+        uses: actions/upload-artifact@v4
+        with:
+          name: video
+          path: output/*
+          retention-days: 3
+      - name: İstifadə olunmuş mövzuları yaz
+        run: |
+          git config user.name "kanal-bot"
+          git config user.email "kanal-bot@users.noreply.github.com"
+          git add state
+          git diff --cached --quiet || (git commit -m "Mövzu yeniləndi" && git pull --rebase && git push)
