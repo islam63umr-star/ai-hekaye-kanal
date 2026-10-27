@@ -287,6 +287,7 @@ def _cf_text_once(model, messages, max_tokens):
 
 
 _CF_GOOD = []
+_DEAD = set()
 
 
 def cf_chat(messages, max_tokens=4096):
@@ -324,54 +325,80 @@ def cf_chat(messages, max_tokens=4096):
     raise RuntimeError("Cloudflare mətn modeli işləmədi: " + last)
 
 
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite",
+                 "gemini-flash-lite-latest", "gemini-2.0-flash"]
+
+
 def gemini_chat(messages, max_tokens=4096):
     key = os.environ["GEMINI_API_KEY"].strip()
     text = "\n\n".join(m["content"] for m in messages)
+    models = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-2.5-flash-lite",
+                          "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.0-flash"] if m]
     last = ""
-    for model in [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-flash-latest"]:
-        if not model:
-            continue
-        for attempt in range(3):
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": key},
-                json={"contents": [{"role": "user", "parts": [{"text": text}]}],
-                      "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9,
-                                           "responseMimeType": "application/json"}},
-                timeout=240)
+    for rnd in range(3):                       # bütün modelləri 3 dövr yoxla
+        for model in models:
+            r = None
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": key},
+                    json={"contents": [{"role": "user", "parts": [{"text": text}]}],
+                          "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9,
+                                               "responseMimeType": "application/json"}},
+                    timeout=240)
+            except requests.RequestException as ex:
+                last = f"{model}: {ex}"
+                continue
             if r.status_code == 200:
                 try:
                     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 except Exception:  # noqa
-                    last = "boş cavab"
-                    break
-            last = f"{model}: {r.status_code} {r.text[:200]}"
-            if r.status_code in (429, 500, 503):
-                time.sleep(20 * (attempt + 1))
-                continue
-            break
+                    last = f"{model}: boş cavab"
+                    continue
+            last = f"{model}: {r.status_code} {r.text[:150]}"
+            print("Gemini modeli keçildi:", last[:200])
+            if r.status_code in (400, 401, 403):
+                if "API key" in r.text or r.status_code in (401, 403):
+                    raise RuntimeError("Gemini açarı problemi: " + last)
+        wait = 45 * (rnd + 1)
+        print(f"Gemini yüklüdür, {wait} san. gözləyirəm...")
+        time.sleep(wait)
     raise RuntimeError("Gemini cavab vermədi: " + last)
 
 
 def llm_chat(messages, max_tokens=4096):
-    """Mətn provayderləri ardıcıllıqla: Groq (açar varsa) -> Cloudflare -> Gemini (açar varsa)"""
+    """Mətn provayderləri: Groq (açar varsa) -> Cloudflare -> Gemini (açar varsa). Hamısı yüklənibsə gözləyib təkrarlayır."""
     providers = []
-    if os.environ.get("GROQ_API_KEY", "").strip():
+    if os.environ.get("GROQ_API_KEY", "").strip() and "Groq" not in _DEAD:
         providers.append(("Groq", groq_chat))
-    if os.environ.get("CLOUDFLARE_API_TOKEN", "").strip():
+    if os.environ.get("CLOUDFLARE_API_TOKEN", "").strip() and "Cloudflare" not in _DEAD:
         providers.append(("Cloudflare", cf_chat))
     if os.environ.get("GEMINI_API_KEY", "").strip():
         providers.append(("Gemini", gemini_chat))
     errors = []
-    for name, fn in providers:
-        try:
-            out = fn(messages, max_tokens)
-            print("Mətn provayderi:", name)
-            return out
-        except Exception as ex:  # noqa
-            errors.append(f"{name}: {str(ex)[:300]}")
-            print("Provayder işləmədi ->", errors[-1])
-    raise RuntimeError("Heç bir mətn provayderi işləmədi. " + " | ".join(errors))
+    for rnd in range(4):
+        alive = [(n, f) for n, f in providers if n not in _DEAD]
+        if not alive:
+            break
+        for name, fn in alive:
+            try:
+                out = fn(messages, max_tokens)
+                print("Mətn provayderi:", name)
+                return out
+            except RateLimit as ex:
+                _DEAD.add(name)           # gündəlik limit bitib, bu iş boyu istifadə etmə
+                errors.append(f"{name}: limit bitib")
+                print(f"{name}: gündəlik limit bitib, keçilir")
+            except Exception as ex:  # noqa
+                if "açarı yanlışdır" in str(ex):
+                    _DEAD.add(name)
+                errors.append(f"{name}: {str(ex)[:300]}")
+                print("Provayder işləmədi ->", errors[-1])
+        if rnd < 3 and any(n not in _DEAD for n, _ in providers):
+            wait = 60 * (rnd + 1)
+            print(f"Hamısı məşğuldur, {wait} san. gözləyirəm (dövr {rnd + 1}/4)")
+            time.sleep(wait)
+    raise RuntimeError("Heç bir mətn provayderi işləmədi. " + " | ".join(errors[-4:]))
 
 
 def parse_json(text):
@@ -384,6 +411,21 @@ def parse_json(text):
         if m:
             return json.loads(m.group(0))
         raise
+
+
+def ask_json(messages, max_tokens=4096):
+    """Mətn AI-dən JSON alır; cavab pozuqdursa 3 dəfə təkrarlayır."""
+    last = None
+    for i in range(3):
+        try:
+            return parse_json(llm_chat(messages, max_tokens))
+        except Exception as ex:  # noqa
+            last = ex
+            if "provayderi işləmədi" in str(ex):
+                raise
+            print("JSON oxunmadı, təkrar cəhd:", str(ex)[:150])
+            time.sleep(10)
+    raise RuntimeError(f"JSON alınmadı: {last}")
 
 
 def used_topics():
@@ -421,7 +463,7 @@ def make_story(minutes):
         '"tags": ["..."], "parts": ["Ein Satz Zusammenfassung pro Teil"]}. '
         "Der Titel soll neugierig machen (max. 80 Zeichen)."
     )
-    plan = parse_json(llm_chat([{"role": "system", "content": sys_msg}, {"role": "user", "content": plan_prompt}], 2000))
+    plan = ask_json([{"role": "system", "content": sys_msg}, {"role": "user", "content": plan_prompt}], 2000)
     plan["parts"] = (plan.get("parts") or [])[:parts_n]
     while len(plan["parts"]) < parts_n:
         plan["parts"].append("Die Geschichte entwickelt sich weiter und steuert auf das Ende zu.")
@@ -437,7 +479,7 @@ def make_story(minutes):
             "Erfinde passende Namen. Zu jedem Satz gehört eine Figur 'c' und Emotion/Szene 'e'. "
             f"{CHAR_HELP} Gib JSON: " '{"sentences": [{"t": "Satz", "c": "held", "e": "wuetend"}]}'
         )
-        data = parse_json(llm_chat([{"role": "system", "content": sys_msg}, {"role": "user", "content": p}]))
+        data = ask_json([{"role": "system", "content": sys_msg}, {"role": "user", "content": p}])
         part = []
         for s in data.get("sentences", []):
             t = str(s.get("t", "")).strip()
@@ -674,7 +716,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["library", "video", "upload"])
     ap.add_argument("--minutes", type=int, default=int(os.environ.get("MINUTES", "10") or 10))
-    ap.add_argument("--max", type=int, default=int(os.environ.get("MAX_IMAGES", "60") or 60))
+    ap.add_argument("--max", type=int, default=int(os.environ.get("MAX_IMAGES", "30") or 30))
     ap.add_argument("--offline", action="store_true")
     a = ap.parse_args()
     if a.cmd == "library":
@@ -687,3 +729,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
